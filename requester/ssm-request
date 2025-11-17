@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# SSM Flexible Duration Client (v2 - verbose + smart selection)
+# - Requests a one-time session for custom minutes (1-240)
+# - Accepts instance number OR instance-id
+# - Clear diagnostics if nothing shows up
+#
+# Usage:
+#   ./ssm-request                      # interactive
+#   ./ssm-request -i i-abc -d 30      # non-interactive
+#   ./ssm-request -p myprof -v        # verbose
+#
+set -euo pipefail
+
+REGION="ap-southeast-1"
+PROFILE=""
+INSTANCE_ID=""
+DURATION=""
+USER_ID=""
+VERBOSE=0
+
+usage() {
+  cat <<EOF
+Usage: ssm-request [-i instance-id] [-d minutes] [-u iam-user] [-p profile] [-r region] [-v]
+  -i   EC2 instance-id (skip interactive picker)
+  -d   duration minutes (1-240)
+  -u   IAM username (default: current caller identity)
+  -p   AWS CLI profile
+  -r   Region (default: ${REGION})
+  -v   Verbose diagnostics
+  -h   Help
+EOF
+  exit 0
+}
+
+while getopts ":i:d:u:p:r:vh" opt; do
+  case $opt in
+    i) INSTANCE_ID="$OPTARG" ;;
+    d) DURATION="$OPTARG" ;;
+    u) USER_ID="$OPTARG" ;;
+    p) PROFILE="--profile $OPTARG" ;;
+    r) REGION="$OPTARG" ;;
+    v) VERBOSE=1 ;;
+    h) usage ;;
+    \?) echo "Invalid option: -$OPTARG" >&2; usage ;;
+  esac
+done
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 1; }; }
+need_cmd aws
+need_cmd jq
+
+say() { echo -e "$*"; }
+dbg() { [[ $VERBOSE -eq 1 ]] && echo "[debug] $*" || true; }
+die() { echo "Error: $*" >&2; exit 1; }
+
+AWS="aws $PROFILE --region $REGION"
+
+# Resolve user
+if [[ -z "${USER_ID}" ]]; then
+  dbg "Resolving caller identity..."
+  ARN=$($AWS sts get-caller-identity --query Arn --output text 2>/tmp/ssmreq.err || true)
+  if [[ -z "${ARN}" || "${ARN}" == "None" ]]; then
+    say ""
+    say "❌ Could not resolve AWS identity."
+    say "   Run: aws configure   (or pass -p PROFILE)"
+    say "   Details:"
+    [[ -f /tmp/ssmreq.err ]] && sed 's/^/   /' /tmp/ssmreq.err || true
+    exit 1
+  fi
+  USER_ID="${ARN##*/}"
+fi
+
+# Determine instance
+if [[ -z "${INSTANCE_ID}" ]]; then
+  say "Fetching running instances in ${REGION} ..."
+  # Do NOT hide errors; capture stdout & stderr
+  DESCRIBE_OUT=$($AWS ec2 describe-instances         --filters "Name=instance-state-name,Values=running"         --query 'Reservations[*].Instances[*].{Id:InstanceId,Name:Tags[?Key==`Name`]|[0].Value,PrivateIp:PrivateIpAddress}'         --output json 2> /tmp/ssmreq.describe.err || true)
+
+  if [[ -s /tmp/ssmreq.describe.err ]]; then
+    say ""
+    say "⚠️  AWS returned an error while listing instances:"
+    sed 's/^/   /' /tmp/ssmreq.describe.err
+  fi
+
+  COUNT=$(echo "${DESCRIBE_OUT:-[]}" | jq 'flatten|length' 2>/dev/null || echo 0)
+  if [[ "${COUNT}" -eq 0 ]]; then
+    say ""
+    say "No running instances found (or you lack permissions in ${REGION})."
+    say "Try one of these:"
+    say "  • Pass a profile:          ./ssm-request -p myprofile"
+    say "  • Specify region:          ./ssm-request -r ap-southeast-1"
+    say "  • Provide instance-id:     ./ssm-request -i i-xxxxxxxxxxxxxx"
+    exit 1
+  fi
+
+  say ""
+  say " #   INSTANCE ID              NAME                               PRIVATE IP"
+  say "--------------------------------------------------------------------------------"
+  idx=1
+  echo "$DESCRIBE_OUT" | jq -r 'flatten[] | "\(.Id)	\(.Name // "-")	\(.PrivateIp // "-")"' | while IFS=$'\t' read -r id name ip; do
+    printf " %d) %-22s %-34s %s\n" "$idx" "$id" "$name" "$ip"
+    idx=$((idx+1))
+  done | tee /tmp/_ssm_instances.txt >/dev/null
+
+  say ""
+  read -rp "Select instance # or paste instance-id: " INSTANCE_INPUT
+
+  if [[ "$INSTANCE_INPUT" =~ ^[0-9]+$ ]]; then
+    LINE=$(sed -n "${INSTANCE_INPUT}p" /tmp/_ssm_instances.txt || true)
+    INSTANCE_ID=$(echo "$LINE" | awk '{print $2}')
+  else
+    # Match by id text
+    INSTANCE_ID=$(awk '{print $2}' /tmp/_ssm_instances.txt | grep -m1 -E "^${INSTANCE_INPUT}$" || true)
+    if [[ -z "$INSTANCE_ID" ]]; then
+      # Try fuzzy contains
+      INSTANCE_ID=$(awk '{print $2}' /tmp/_ssm_instances.txt | grep -m1 -E "${INSTANCE_INPUT}" || true)
+    end_if=true
+    fi
+  fi
+
+  rm -f /tmp/_ssm_instances.txt
+  [[ -z "${INSTANCE_ID}" ]] && die "Invalid selection."
+fi
+
+# Duration
+if [[ -z "${DURATION}" ]]; then
+  read -rp "Enter session duration in minutes (1-240): " DURATION
+fi
+[[ "$DURATION" =~ ^[0-9]+$ ]] || die "Duration must be a number."
+(( DURATION >= 1 && DURATION <= 240 )) || die "Duration must be between 1 and 240."
+
+say ""
+say "Requesting one-time session:"
+say "  User      : ${USER_ID}"
+say "  Instance  : ${INSTANCE_ID}"
+say "  Duration  : ${DURATION} minutes"
+say "  Region    : ${REGION}"
+say ""
+
+PAYLOAD=$(jq -n --arg u "$USER_ID" --arg i "$INSTANCE_ID" --argjson d "$DURATION" '{user_id:$u,instance_id:$i,duration_minutes:$d}')
+LRESP=$($AWS lambda invoke       --function-name create_onetime_session       --payload "$PAYLOAD"       --cli-binary-format raw-in-base64-out       /dev/stdout 2> /tmp/ssmreq.lambda.err || true)
+
+if [[ -s /tmp/ssmreq.lambda.err ]]; then
+  say "⚠️  Lambda invoke stderr:"
+  sed 's/^/   /' /tmp/ssmreq.lambda.err
+fi
+
+STATUS=$(echo "$LRESP" | jq -r '.statusCode // empty')
+BODY=$(echo "$LRESP" | jq -r '.body // "{}"')
+
+if [[ "$STATUS" != "200" ]]; then
+  ERR=$(echo "$BODY" | jq -r '.error // .message // "Unknown error"')
+  EXIST=$(echo "$BODY" | jq -r '.existing_token // empty')
+  say ""
+  say "❌ Lambda error ($STATUS): $ERR"
+  [[ -n "$EXIST" ]] && say "Existing active token: $EXIST (wait to expire or ask admin to cleanup)"
+  exit 2
+fi
+
+TOKEN=$(echo "$BODY" | jq -r '.token')
+EXPIRES=$(echo "$BODY" | jq -r '.expires_at')
+say "✅ Token: $TOKEN"
+say "   Expires at: $EXPIRES"
+say ""
+
+# Ensure Online
+PING=$($AWS ssm describe-instance-information       --query "InstanceInformationList[?InstanceId=='$INSTANCE_ID'].[PingStatus]" --output text 2>/dev/null || true)
+if [[ "$PING" != "Online" ]]; then
+  say "❌ Instance is not Online in SSM (PingStatus=$PING)."
+  say "   Ensure role SSM-Enhanced-Instance-Dev-Role attached and amazon-ssm-agent running."
+  exit 3
+fi
+
+say "Starting SSM session (auto-termination in ${DURATION} min)..."
+$AWS ssm start-session --target "$INSTANCE_ID"
+EXIT_CODE=$?
+
+say ""
+say "Session ended (exit=${EXIT_CODE}). Token is one-time; request another for a new session."
+exit $EXIT_CODE

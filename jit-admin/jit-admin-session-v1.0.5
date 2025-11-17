@@ -1,0 +1,736 @@
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# jit-admin-session v1.0.4 — Admin-driven JIT SSM access with cleanup mode
+# - Grants short‑lived StartSession (Resource="*") to avoid SSM scoping quirks
+# - Optional tag guard: --require-tag KEY=VALUE (Condition on ssm:resourceTag/KEY)
+# - Auto‑revokes inline policy AND force‑terminates any live sessions at expiry
+# - Stronger enforcer: handles Owner as username or full ARN + paginated listings
+# - Generates a single all-in-one setup script with embedded tool installation
+# - v1.0.4: Added --purge-session mode to cleanup policies, sessions, and access keys
+#
+# Requirements: bash, awscli v2, jq, openssl
+# Default region: ap-southeast-1
+#
+
+REGION="ap-southeast-1"
+USERNAME=""
+INSTANCE_ID=""
+DURATION_MIN=""
+NEW_USER=0
+CREATE_KEYS=0
+CONFIGURE_PROFILE=""
+PURGE_EXISTING=0
+LOCAL_AWS_PROFILE=""
+REQUIRE_TAG=""      # e.g. JIT=allowed
+OUTPUT_SCRIPT=""    # Path to generate user setup script
+PURGE_SESSION=0     # Cleanup mode
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1" >&2; exit 1; }; }
+need aws
+need jq
+need openssl
+need date
+
+usage() {
+  cat <<'EOS'
+Usage:
+  jit-admin-session -u USER -i INSTANCE -d MINUTES [options]
+  jit-admin-session --purge-session USER [options]
+
+Required (for normal mode):
+  -u USER           IAM username (e.g., tony-03)
+  -i INSTANCE       EC2 instance-id (e.g., i-0ee0bc84a481f7852)
+  -d MINUTES        Duration 1..240
+
+Options:
+  --new-user                    Create IAM user if missing
+  --create-keys                 Create programmatic access key for the user
+  --configure-profile NAME      Write credentials to local AWS profile NAME
+  --output-script PATH          Generate all-in-one setup script at PATH (e.g., setup-tony-03.sh)
+  --purge-existing              Delete existing inline OneTimeSSM-* policies on the user first
+  --purge-session USER          Cleanup mode: terminate sessions, delete policies & access keys
+  --require-tag KEY=VALUE       Only allow StartSession when SSM managed instance has this tag
+  -r, --region REGION           Default: ap-southeast-1
+  --local-admin-profile NAME    Use this local AWS CLI profile for admin actions
+  -h, --help                    Show help
+
+Examples:
+  # Create new user with all-in-one setup script
+  jit-admin-session -u tony-03 -i i-0ee0... -d 30 --new-user --create-keys --output-script setup-tony-03.sh
+
+  # Renew access for existing user
+  jit-admin-session -u tony-03 -i i-0ee0... -d 60 --purge-existing
+
+  # Cleanup everything for a user (sessions + policies + access keys)
+  jit-admin-session --purge-session tony-04
+
+  # With tag requirement
+  jit-admin-session -u tony-03 -i i-0ee0... -d 90 --new-user --create-keys --output-script setup-tony-03.sh --require-tag JIT=allowed
+EOS
+  exit 0
+}
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -u) USERNAME="$2"; shift 2;;
+    -i) INSTANCE_ID="$2"; shift 2;;
+    -d) DURATION_MIN="$2"; shift 2;;
+    --new-user) NEW_USER=1; shift;;
+    --create-keys) CREATE_KEYS=1; shift;;
+    --configure-profile) CONFIGURE_PROFILE="$2"; shift 2;;
+    --output-script) OUTPUT_SCRIPT="$2"; shift 2;;
+    --purge-existing) PURGE_EXISTING=1; shift;;
+    --purge-session) PURGE_SESSION=1; USERNAME="$2"; shift 2;;
+    --require-tag) REQUIRE_TAG="$2"; shift 2;;
+    -r|--region) REGION="$2"; shift 2;;
+    --local-admin-profile) LOCAL_AWS_PROFILE="--profile $2"; shift 2;;
+    -h|--help) usage ;;
+    *) echo "Unknown arg: $1" >&2; usage ;;
+  esac
+done
+
+AWS="aws $LOCAL_AWS_PROFILE --region $REGION"
+
+# ============================================
+# PURGE SESSION MODE
+# ============================================
+if [[ $PURGE_SESSION -eq 1 ]]; then
+  if [[ -z "$USERNAME" ]]; then
+    echo "Error: --purge-session requires a username" >&2
+    usage
+  fi
+
+  echo "🧹 Purge mode for user: $USERNAME"
+  echo "=============================================="
+  echo ""
+
+  # Check if user exists
+  if ! $AWS iam get-user --user-name "$USERNAME" >/dev/null 2>&1; then
+    echo "❌ User $USERNAME not found"
+    exit 1
+  fi
+
+  # 1. Terminate all active sessions for this user
+  echo "🔍 Looking for active SSM sessions..."
+  SESS_JSON='{"Sessions":[]}'
+  NEXT=""
+  while : ; do
+    if [[ -n "$NEXT" ]]; then
+      PAGE=$($AWS ssm describe-sessions --state Active --max-results 50 --next-token "$NEXT" 2>/dev/null || echo '{}')
+    else
+      PAGE=$($AWS ssm describe-sessions --state Active --max-results 50 2>/dev/null || echo '{}')
+    fi
+    SESS_JSON=$(jq -n --argjson acc "$SESS_JSON" --argjson pg "$PAGE" \
+      '$acc | .Sessions += ($pg.Sessions // [])')
+    NEXT=$(echo "$PAGE" | jq -r '.NextToken // empty')
+    [[ -z "$NEXT" ]] && break
+  done
+
+  # Match sessions where Owner == username OR endswith /username
+  SIDS=$(echo "$SESS_JSON" | jq -r --arg user "$USERNAME" '
+    .Sessions
+    | map(select((.Owner == $user) or (.Owner|tostring|endswith("/"+$user))))
+    | .[].SessionId
+  ')
+
+  if [[ -n "$SIDS" ]]; then
+    echo "Found active session(s):"
+    for SID in $SIDS; do
+      echo "  - $SID"
+    done
+    echo ""
+    echo "⛔ Terminating sessions..."
+    for SID in $SIDS; do
+      $AWS ssm terminate-session --session-id "$SID" >/dev/null 2>&1 || true
+      echo "  ✅ Terminated $SID"
+    done
+  else
+    echo "ℹ️  No active sessions found"
+  fi
+  echo ""
+
+  # 2. Delete all OneTimeSSM inline policies
+  echo "🗑️  Deleting OneTimeSSM-* policies..."
+  EXISTING=$($AWS iam list-user-policies --user-name "$USERNAME" --query 'PolicyNames[]' --output text || true)
+  DELETED=0
+  for P in $EXISTING; do
+    if [[ "$P" == OneTimeSSM-* ]]; then
+      echo "  - Deleting $P"
+      $AWS iam delete-user-policy --user-name "$USERNAME" --policy-name "$P" || true
+      ((DELETED++))
+    fi
+  done
+  if [[ $DELETED -eq 0 ]]; then
+    echo "ℹ️  No OneTimeSSM policies found"
+  else
+    echo "  ✅ Deleted $DELETED policy(ies)"
+  fi
+  echo ""
+
+  # 3. Delete all access keys
+  echo "🔑 Deleting access keys..."
+  KEYS_JSON=$($AWS iam list-access-keys --user-name "$USERNAME" --output json)
+  KEY_COUNT=$(echo "$KEYS_JSON" | jq '.AccessKeyMetadata | length')
+
+  if [[ "$KEY_COUNT" -eq 0 ]]; then
+    echo "ℹ️  No access keys found"
+  else
+    echo "Found $KEY_COUNT access key(s):"
+    echo "$KEYS_JSON" | jq -r '.AccessKeyMetadata[] | "  - \(.AccessKeyId) (created: \(.CreateDate))"'
+    echo ""
+
+    read -p "Delete all $KEY_COUNT access key(s)? [y/N] " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      ACCESS_KEY_IDS=$(echo "$KEYS_JSON" | jq -r '.AccessKeyMetadata[].AccessKeyId')
+      for KEY_ID in $ACCESS_KEY_IDS; do
+        echo "  - Deleting $KEY_ID"
+        $AWS iam delete-access-key --user-name "$USERNAME" --access-key-id "$KEY_ID"
+      done
+      echo "  ✅ Deleted all access keys"
+    else
+      echo "  ⏭️  Skipped access key deletion"
+    fi
+  fi
+
+  echo ""
+  echo "✅ Purge complete for $USERNAME!"
+  echo "=============================================="
+  exit 0
+fi
+
+# ============================================
+# NORMAL MODE (Grant Access)
+# ============================================
+
+# Validate
+if [[ -z "$USERNAME" || -z "$INSTANCE_ID" || -z "$DURATION_MIN" ]]; then
+  usage
+fi
+if ! [[ "$DURATION_MIN" =~ ^[0-9]+$ ]]; then
+  echo "Duration must be a number." >&2; exit 1
+fi
+if (( DURATION_MIN < 1 || DURATION_MIN > 240 )); then
+  echo "Duration must be 1..240." >&2; exit 1
+fi
+if [[ -n "$REQUIRE_TAG" && "$REQUIRE_TAG" != *=* ]]; then
+  echo "--require-tag must be KEY=VALUE" >&2; exit 1
+fi
+
+echo "🔧 Admin profile: ${LOCAL_AWS_PROFILE:-default} | Region: $REGION"
+echo "User: $USERNAME | Instance: $INSTANCE_ID | Duration: ${DURATION_MIN}m"
+[[ -n "$REQUIRE_TAG" ]] && echo "🔒 Tag guard: $REQUIRE_TAG"
+
+# Ensure user
+if [[ $NEW_USER -eq 1 ]]; then
+  if $AWS iam get-user --user-name "$USERNAME" >/dev/null 2>&1; then
+    echo "ℹ️  User $USERNAME already exists."
+  else
+    $AWS iam create-user --user-name "$USERNAME" >/dev/null
+    echo "✅ Created IAM user: $USERNAME"
+  fi
+else
+  if ! $AWS iam get-user --user-name "$USERNAME" >/dev/null 2>&1; then
+    echo "User $USERNAME not found. Use --new-user to create." >&2
+    exit 1
+  fi
+fi
+
+ACCESS_KEY_ID=""
+SECRET_ACCESS_KEY=""
+if [[ $CREATE_KEYS -eq 1 ]]; then
+  echo "🔐 Creating access keys for $USERNAME ..."
+  KEY_JSON=$($AWS iam create-access-key --user-name "$USERNAME" --output json)
+  ACCESS_KEY_ID=$(echo "$KEY_JSON" | jq -r '.AccessKey.AccessKeyId')
+  SECRET_ACCESS_KEY=$(echo "$KEY_JSON" | jq -r '.AccessKey.SecretAccessKey')
+  echo "✅ Access keys created."
+  echo "$KEY_JSON" | jq .
+fi
+
+if [[ -n "$CONFIGURE_PROFILE" ]]; then
+  if [[ -z "$ACCESS_KEY_ID" || -z "$SECRET_ACCESS_KEY" ]]; then
+    echo "Cannot --configure-profile without --create-keys in this run." >&2
+    exit 1
+  fi
+  echo "📝 Writing local AWS CLI profile [$CONFIGURE_PROFILE] ..."
+  aws configure set aws_access_key_id "$ACCESS_KEY_ID" --profile "$CONFIGURE_PROFILE"
+  aws configure set aws_secret_access_key "$SECRET_ACCESS_KEY" --profile "$CONFIGURE_PROFILE"
+  aws configure set region "$REGION" --profile "$CONFIGURE_PROFILE"
+  aws configure set output json --profile "$CONFIGURE_PROFILE"
+  echo "✅ Local profile [$CONFIGURE_PROFILE] configured."
+  echo "🔎 Test: aws sts get-caller-identity --profile $CONFIGURE_PROFILE"
+fi
+
+# Generate all-in-one user setup script
+if [[ -n "$OUTPUT_SCRIPT" ]]; then
+  if [[ -z "$ACCESS_KEY_ID" || -z "$SECRET_ACCESS_KEY" ]]; then
+    echo "Cannot --output-script without --create-keys in this run." >&2
+    exit 1
+  fi
+
+  PROFILE_NAME="${CONFIGURE_PROFILE:-$USERNAME}"
+
+  cat > "$OUTPUT_SCRIPT" <<'SCRIPT_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# AWS SSM All-in-One Setup Script for: USERNAME_PLACEHOLDER
+# Generated on: DATE_PLACEHOLDER
+# Instance: INSTANCE_PLACEHOLDER
+# Region: REGION_PLACEHOLDER
+# Access Duration: DURATION_PLACEHOLDER minutes
+#
+# This script will:
+# 1. Install AWS CLI, jq, and Session Manager plugin (if needed)
+# 2. Configure your AWS profile
+# 3. Connect to the SSM session automatically
+#
+
+USERNAME="USERNAME_PLACEHOLDER"
+INSTANCE_ID="INSTANCE_PLACEHOLDER"
+REGION="REGION_PLACEHOLDER"
+PROFILE_NAME="PROFILE_PLACEHOLDER"
+ACCESS_KEY_ID="ACCESS_KEY_PLACEHOLDER"
+SECRET_ACCESS_KEY="SECRET_KEY_PLACEHOLDER"
+
+echo "🚀 AWS SSM All-in-One Setup for $USERNAME"
+echo "=============================================="
+echo ""
+
+# Detect platform
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  PLATFORM="macos"
+  if [[ "$(uname -m)" == "arm64" ]]; then
+    ARCH="arm64"
+  else
+    ARCH="x86_64"
+  fi
+elif [[ -f /etc/os-release ]]; then
+  . /etc/os-release
+  PLATFORM="$ID"
+  ARCH="$(uname -m)"
+else
+  PLATFORM="linux"
+  ARCH="$(uname -m)"
+fi
+
+echo "ℹ️  Detected: $PLATFORM ($ARCH)"
+echo ""
+
+# Function to install tools
+install_tools() {
+  echo "📦 Installing required tools..."
+  echo "-----------------------------------------------"
+
+  # Install jq
+  echo "🔧 Checking jq..."
+  if command -v jq >/dev/null 2>&1; then
+    echo "✅ jq already installed: $(jq --version)"
+  else
+    echo "Installing jq..."
+    case "$PLATFORM" in
+      macos)
+        if command -v brew >/dev/null 2>&1; then
+          brew install jq
+        else
+          echo "❌ Homebrew not found. Installing Homebrew first..."
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          brew install jq
+        fi
+        ;;
+      ubuntu|debian)
+        sudo apt-get update -y && sudo apt-get install -y jq
+        ;;
+      amzn|amazon|rhel|centos|rocky|alma|ol)
+        if command -v dnf >/dev/null 2>&1; then
+          sudo dnf install -y jq
+        else
+          sudo yum install -y jq
+        fi
+        ;;
+      *)
+        echo "⚠️  Unsupported OS for jq auto-install. Please install jq manually."
+        ;;
+    esac
+  fi
+
+  # Install AWS CLI
+  echo ""
+  echo "🔧 Checking AWS CLI..."
+  if command -v aws >/dev/null 2>&1; then
+    echo "✅ AWS CLI already installed: $(aws --version 2>&1)"
+  else
+    echo "Installing AWS CLI v2..."
+    case "$PLATFORM" in
+      macos)
+        if command -v brew >/dev/null 2>&1; then
+          brew install awscli
+        else
+          echo "❌ Homebrew not found. Installing Homebrew first..."
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          brew install awscli
+        fi
+        ;;
+      ubuntu|debian|amzn|amazon|rhel|centos|rocky|alma|ol|linux)
+        tmpdir=$(mktemp -d)
+        cd "$tmpdir"
+        if [[ "$ARCH" == "aarch64" ]] || [[ "$ARCH" == "arm64" ]]; then
+          curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o awscliv2.zip
+        else
+          curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+        fi
+        unzip -q awscliv2.zip
+        sudo ./aws/install
+        cd - >/dev/null
+        rm -rf "$tmpdir"
+        ;;
+      *)
+        echo "⚠️  Unsupported OS for AWS CLI auto-install. Please install manually."
+        ;;
+    esac
+  fi
+
+  # Install Session Manager plugin
+  echo ""
+  echo "🔧 Checking Session Manager plugin..."
+  if command -v session-manager-plugin >/dev/null 2>&1; then
+    echo "✅ Session Manager plugin already installed"
+  else
+    echo "Installing Session Manager plugin..."
+    case "$PLATFORM" in
+      macos)
+        if command -v brew >/dev/null 2>&1; then
+          brew install --cask session-manager-plugin
+        else
+          tmpdir=$(mktemp -d)
+          cd "$tmpdir"
+          if [[ "$ARCH" == "arm64" ]]; then
+            curl -sSL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac_arm64/session-manager-plugin.pkg" -o session-manager-plugin.pkg
+          else
+            curl -sSL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/mac/session-manager-plugin.pkg" -o session-manager-plugin.pkg
+          fi
+          sudo installer -pkg session-manager-plugin.pkg -target /
+          cd - >/dev/null
+          rm -rf "$tmpdir"
+        fi
+        ;;
+      ubuntu|debian)
+        tmpdir=$(mktemp -d)
+        cd "$tmpdir"
+        if [[ "$ARCH" == "aarch64" ]] || [[ "$ARCH" == "arm64" ]]; then
+          curl -sSL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_arm64/session-manager-plugin.deb" -o session-manager-plugin.deb
+        else
+          curl -sSL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o session-manager-plugin.deb
+        fi
+        sudo dpkg -i session-manager-plugin.deb
+        cd - >/dev/null
+        rm -rf "$tmpdir"
+        ;;
+      amzn|amazon|rhel|centos|rocky|alma|ol)
+        tmpdir=$(mktemp -d)
+        cd "$tmpdir"
+        if [[ "$ARCH" == "aarch64" ]] || [[ "$ARCH" == "arm64" ]]; then
+          curl -sSL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_arm64/session-manager-plugin.rpm" -o session-manager-plugin.rpm
+        else
+          curl -sSL "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/linux_64bit/session-manager-plugin.rpm" -o session-manager-plugin.rpm
+        fi
+        if command -v dnf >/dev/null 2>&1; then
+          sudo dnf install -y session-manager-plugin.rpm
+        else
+          sudo yum install -y session-manager-plugin.rpm
+        fi
+        cd - >/dev/null
+        rm -rf "$tmpdir"
+        ;;
+      *)
+        echo "⚠️  Unsupported OS for Session Manager plugin auto-install."
+        echo "Please install manually from:"
+        echo "  https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
+        ;;
+    esac
+  fi
+
+  echo ""
+  echo "✅ Tool installation check complete!"
+  echo "-----------------------------------------------"
+}
+
+# Check and install tools if needed
+TOOLS_NEEDED=0
+if ! command -v aws >/dev/null 2>&1; then
+  echo "⚠️  AWS CLI not found"
+  TOOLS_NEEDED=1
+fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "⚠️  jq not found"
+  TOOLS_NEEDED=1
+fi
+if ! command -v session-manager-plugin >/dev/null 2>&1; then
+  echo "⚠️  Session Manager plugin not found"
+  TOOLS_NEEDED=1
+fi
+
+if [[ $TOOLS_NEEDED -eq 1 ]]; then
+  echo ""
+  read -p "Install missing tools automatically? [Y/n] " -n 1 -r
+  echo
+  if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
+    install_tools
+  else
+    echo "❌ Cannot proceed without required tools."
+    echo "Please install manually or run this script again."
+    exit 1
+  fi
+else
+  echo "✅ All required tools already installed"
+  echo "  AWS CLI: $(aws --version 2>&1)"
+  echo "  jq: $(jq --version 2>&1)"
+  echo "  Session Manager plugin: installed"
+fi
+
+# Configure AWS profile
+echo ""
+echo "=============================================="
+if aws configure get aws_access_key_id --profile "$PROFILE_NAME" >/dev/null 2>&1; then
+  echo "ℹ️  Profile [$PROFILE_NAME] already exists"
+
+  # Verify if existing credentials work
+  echo "🔎 Verifying existing credentials..."
+  if aws sts get-caller-identity --profile "$PROFILE_NAME" >/dev/null 2>&1; then
+    echo "✅ Existing credentials are valid!"
+    aws sts get-caller-identity --profile "$PROFILE_NAME"
+  else
+    echo "⚠️  Existing credentials failed, re-configuring with new credentials..."
+    aws configure set aws_access_key_id "$ACCESS_KEY_ID" --profile "$PROFILE_NAME"
+    aws configure set aws_secret_access_key "$SECRET_ACCESS_KEY" --profile "$PROFILE_NAME"
+    aws configure set region "$REGION" --profile "$PROFILE_NAME"
+    aws configure set output json --profile "$PROFILE_NAME"
+    echo "✅ Profile re-configured!"
+
+    # Verify new credentials
+    echo "🔎 Verifying new credentials..."
+    if aws sts get-caller-identity --profile "$PROFILE_NAME" >/dev/null 2>&1; then
+      echo "✅ New credentials verified!"
+      aws sts get-caller-identity --profile "$PROFILE_NAME"
+    else
+      echo "❌ New credential verification failed!"
+      echo "Please contact your administrator for new credentials."
+      exit 1
+    fi
+  fi
+else
+  echo "🔐 Configuring AWS profile [$PROFILE_NAME]..."
+  aws configure set aws_access_key_id "$ACCESS_KEY_ID" --profile "$PROFILE_NAME"
+  aws configure set aws_secret_access_key "$SECRET_ACCESS_KEY" --profile "$PROFILE_NAME"
+  aws configure set region "$REGION" --profile "$PROFILE_NAME"
+  aws configure set output json --profile "$PROFILE_NAME"
+  echo "✅ Profile configured!"
+
+  # Verify credentials
+  echo ""
+  echo "🔎 Verifying credentials..."
+  if aws sts get-caller-identity --profile "$PROFILE_NAME" >/dev/null 2>&1; then
+    echo "✅ Credentials verified!"
+    aws sts get-caller-identity --profile "$PROFILE_NAME"
+  else
+    echo "❌ Credential verification failed!"
+    echo "Please contact your administrator for valid credentials."
+    exit 1
+  fi
+fi
+
+# Start SSM session
+echo ""
+echo "=============================================="
+echo "🎯 Connecting to $INSTANCE_ID..."
+echo "=============================================="
+echo ""
+
+aws ssm start-session --target $INSTANCE_ID --document-name SSM-SessionManagerRunShell --region $REGION --profile $PROFILE_NAME
+
+echo ""
+echo "✅ Session ended."
+echo ""
+echo "💡 To reconnect, simply run: bash $0"
+SCRIPT_EOF
+
+  # Replace placeholders using a different delimiter (|) to handle special characters like /
+  sed -i.bak "s|USERNAME_PLACEHOLDER|$USERNAME|g" "$OUTPUT_SCRIPT"
+  sed -i.bak "s|INSTANCE_PLACEHOLDER|$INSTANCE_ID|g" "$OUTPUT_SCRIPT"
+  sed -i.bak "s|REGION_PLACEHOLDER|$REGION|g" "$OUTPUT_SCRIPT"
+  sed -i.bak "s|PROFILE_PLACEHOLDER|$PROFILE_NAME|g" "$OUTPUT_SCRIPT"
+  sed -i.bak "s|ACCESS_KEY_PLACEHOLDER|$ACCESS_KEY_ID|g" "$OUTPUT_SCRIPT"
+  sed -i.bak "s|SECRET_KEY_PLACEHOLDER|$SECRET_ACCESS_KEY|g" "$OUTPUT_SCRIPT"
+  sed -i.bak "s|DATE_PLACEHOLDER|$(date +"%Y-%m-%d %H:%M:%S %Z")|g" "$OUTPUT_SCRIPT"
+  sed -i.bak "s|DURATION_PLACEHOLDER|${DURATION_MIN}|g" "$OUTPUT_SCRIPT"
+  rm -f "$OUTPUT_SCRIPT.bak"
+
+  chmod +x "$OUTPUT_SCRIPT"
+  echo "✅ All-in-one setup script generated: $OUTPUT_SCRIPT"
+  echo ""
+  echo "📤 Send this ONE file to the user: $OUTPUT_SCRIPT"
+  echo ""
+  echo "📋 User instructions:"
+  echo "   1. Run: bash $OUTPUT_SCRIPT"
+  echo "   2. Script will install tools if needed and connect automatically"
+  echo "   3. To reconnect later: bash $OUTPUT_SCRIPT (reusable!)"
+  echo ""
+fi
+
+# Optionally purge existing OneTimeSSM inline policies
+if [[ $PURGE_EXISTING -eq 1 ]]; then
+  echo "🧹 Purging existing OneTimeSSM-* inline policies for $USERNAME ..."
+  EXISTING=$($AWS iam list-user-policies --user-name "$USERNAME" --query 'PolicyNames[]' --output text || true)
+  for P in $EXISTING; do
+    if [[ "$P" == OneTimeSSM-* ]]; then
+      echo " - Deleting $P"
+      $AWS iam delete-user-policy --user-name "$USERNAME" --policy-name "$P" || true
+    fi
+  done
+  echo "✅ Purge complete."
+fi
+
+# Create StartSession policy JSON (Resource="*" to avoid SSM scoping issues)
+TOKEN="onetime-$(openssl rand -hex 8)"
+POLICY_NAME="OneTimeSSM-$TOKEN"
+
+POLICY_JSON=$(jq -n --arg region "$REGION" --arg account "$($AWS sts get-caller-identity --query Account --output text)" '
+  {
+    Version: "2012-10-17",
+    Statement: [
+      {
+        Sid: "StartSessionAnyManagedInstance",
+        Effect: "Allow",
+        Action: "ssm:StartSession",
+        Resource: [
+          "arn:aws:ec2:*:*:instance/*",
+          "arn:aws:ssm:*:*:managed-instance/*"
+        ]
+      },
+      {
+        Sid: "StartSessionDocument",
+        Effect: "Allow",
+        Action: "ssm:StartSession",
+        Resource: "arn:aws:ssm:\($region):\($account):document/SSM-SessionManagerRunShell"
+      },
+      {
+        Sid: "BasicDescribe",
+        Effect: "Allow",
+        Action: ["ssm:DescribeSessions","ssm:GetConnectionStatus","ec2:DescribeInstances"],
+        Resource: "*"
+      },
+      {
+        Sid: "TerminateOwnSession",
+        Effect: "Allow",
+        Action: "ssm:TerminateSession",
+        Resource: "*"
+      }
+    ]
+  }')
+
+# Inject tag condition if requested
+if [[ -n "$REQUIRE_TAG" ]]; then
+  TAG_KEY="${REQUIRE_TAG%%=*}"
+  TAG_VAL="${REQUIRE_TAG#*=}"
+  POLICY_JSON=$(echo "$POLICY_JSON" | jq --arg k "$TAG_KEY" --arg v "$TAG_VAL" '
+    .Statement[0] += {Condition: {StringEquals: {("ssm:resourceTag/" + $k): $v}}}
+  ')
+fi
+
+# Write policy file
+echo "$POLICY_JSON" > /tmp/one-time-ssm-policy.json
+
+# Attach inline policy
+$AWS iam put-user-policy \
+  --user-name "$USERNAME" \
+  --policy-name "$POLICY_NAME" \
+  --policy-document file:///tmp/one-time-ssm-policy.json
+
+echo "✅ Policy attached: $POLICY_NAME"
+
+# Verify instance SSM Online
+PING=$($AWS ssm describe-instance-information \
+  --query "InstanceInformationList[?InstanceId=='$INSTANCE_ID'].[PingStatus]" --output text 2>/dev/null || true)
+echo "🔎 SSM PingStatus for ${INSTANCE_ID}: ${PING:-Unknown}"
+
+# Compute expiry timestamp
+EXPIRE_AT_EPOCH=$(( $(date +%s) + DURATION_MIN*60 ))
+echo "⏱️  Access window expires at: $(date -r $EXPIRE_AT_EPOCH +"%Y-%m-%d %H:%M:%S %Z")"
+
+# --- begin stronger enforcer ---
+(
+  NOW=$(date +%s)
+  SLEEP_SECS=$(( EXPIRE_AT_EPOCH - NOW ))
+  (( SLEEP_SECS > 0 )) && sleep "$SLEEP_SECS"
+
+  echo "⏳ Expiring access for $USERNAME ..."
+  echo "$(date): Starting enforcement for $USERNAME"
+
+  # Delete IAM policy
+  $AWS iam delete-user-policy --user-name "$USERNAME" --policy-name "$POLICY_NAME" >/dev/null 2>&1 || true
+  echo "$(date): Deleted IAM policy $POLICY_NAME"
+
+  # Terminate sessions - run 3 times over 60 seconds to handle stragglers
+  for round in 1 2 3; do
+    echo "$(date): Termination round $round/3"
+
+    # Gather all active sessions via pagination
+    SESS_JSON='{"Sessions":[]}'
+    NEXT=""
+    while : ; do
+      if [[ -n "$NEXT" ]]; then
+        PAGE=$($AWS ssm describe-sessions --state Active --max-results 50 --next-token "$NEXT" 2>/dev/null || echo '{}')
+      else
+        PAGE=$($AWS ssm describe-sessions --state Active --max-results 50 2>/dev/null || echo '{}')
+      fi
+      SESS_JSON=$(jq -n --argjson acc "$SESS_JSON" --argjson pg "$PAGE" \
+        '$acc | .Sessions += ($pg.Sessions // [])')
+      NEXT=$(echo "$PAGE" | jq -r '.NextToken // empty')
+      [[ -z "$NEXT" ]] && break
+    done
+
+    # Match sessions for this user (any instance)
+    SIDS=$(echo "$SESS_JSON" | jq -r --arg user "$USERNAME" '
+      .Sessions
+      | map(select((.Owner == $user) or (.Owner|tostring|endswith("/"+$user))))
+      | .[].SessionId
+    ')
+
+    if [[ -n "$SIDS" ]]; then
+      for SID in $SIDS; do
+        echo "$(date): ⛔ Terminating session $SID"
+        $AWS ssm terminate-session --session-id "$SID" >/dev/null 2>&1 || true
+      done
+    else
+      echo "$(date): No active sessions found for $USERNAME"
+    fi
+
+    # Wait between rounds (except last round)
+    if [ $round -lt 3 ]; then
+      sleep 20
+    fi
+  done
+
+  echo "$(date): ✅ Enforcement complete for $USERNAME"
+) >/tmp/jit-admin-session."$USERNAME".log 2>&1 & disown
+# --- end stronger enforcer ---
+
+
+if [[ -z "$OUTPUT_SCRIPT" ]]; then
+  PROFILE_TO_USE="${CONFIGURE_PROFILE:-$USERNAME}"
+  CONNECT_CMD="aws ssm start-session --target ${INSTANCE_ID} --document-name SSM-SessionManagerRunShell --region ${REGION} --profile ${PROFILE_TO_USE}"
+  
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo "🎯 USER CONNECTION COMMAND"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo ""
+  echo "Send this command to ${USERNAME}:"
+  echo ""
+  echo "  ${CONNECT_CMD}"
+  echo ""
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  [[ -n "$REQUIRE_TAG" ]] && echo "ℹ️  Instance must have SSM managed-instance tag ${REQUIRE_TAG} for StartSession to succeed."
+fi
+
